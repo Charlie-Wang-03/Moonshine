@@ -110,6 +110,12 @@ def normalize_project_slug(value: str) -> str:
     return (text[:80].strip("_") or "research_project")
 
 
+QUALITY_GATE_AGENT_SLUGS = {
+    "research-control-loop",
+    "neural-network-functions-researcher",
+}
+
+
 def build_research_mode_policy(project_slug: str, agent_slug: str = "") -> str:
     """Return the system-prompt policy injected for mode=research."""
     lines = [
@@ -122,7 +128,7 @@ def build_research_mode_policy(project_slug: str, agent_slug: str = "") -> str:
         "- Match each nontrivial research step to the available skills and tools. When a listed skill fits the step, call `load_skill_definition` before using that skill's workflow unless the full definition is already in context.\n"
         % project_slug
     ]
-    if str(agent_slug or "").strip() != "moonshine-core":
+    if str(agent_slug or "").strip() in QUALITY_GATE_AGENT_SLUGS:
         lines.append(
             "- Serious gate: do not start solving a selected problem until it has passed one dedicated `quality-assessor` review. If no passed review exists for the active problem, load `quality-assessor`, call `assess_problem_quality` once, and keep refining/designing the problem instead of attacking it as a theorem."
         )
