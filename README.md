@@ -116,16 +116,23 @@ For detailed options, see [Runtime Home](#runtime-home),
 [Provider Setup](#provider-setup), [Research Mode](#research-mode), and
 [Memory and Retrieval](#memory-and-retrieval) after this first-run path.
 
+After downloading and extracting Moonshine, enter the code repository folder and
+run the commands below.
+
+The examples use `--home moonshine-home`. This creates a visible
+`moonshine-home/` runtime folder for config, keys, projects, sessions, memory,
+skills, tools, and agents. Use the same `--home` value in later commands.
+
 ### 1. Install Moonshine
 
-From the repository root:
+Run this from the code repository folder:
 
 ```bash
 python -m pip install -e ".[all]" --no-build-isolation
 ```
 
-If installation fails with a build-tool error such as missing `wheel` or
-`bdist_wheel`, update the local build tools and retry:
+If installation fails with a build-tool error, update the local build tools and
+retry:
 
 ```bash
 python -m pip install -U pip setuptools wheel
@@ -134,20 +141,14 @@ python -m pip install -e ".[all]" --no-build-isolation
 
 ### 2. Initialize a runtime home
 
-Use the default runtime home:
+Create a runtime home:
 
 ```bash
-python -m moonshine init
+python -m moonshine --home moonshine-home init
 ```
 
-Or choose one explicitly:
-
-```bash
-python -m moonshine --home /home/ubuntu/.moonshine init
-```
-
-Use the same `--home` value for later commands that should share the same
-projects, sessions, credentials, memory, skills, tools, and agents.
+`moonshine-home` is the runtime data folder. Keep using the same `--home` value
+in later commands.
 
 ### 3. Configure the main provider
 
@@ -161,47 +162,55 @@ Moonshine has three provider slots:
 - `archival`: research-log archival calls
 
 By default, `verification` and `archival` inherit `main`, so a first run only
-needs the `main` provider. Dedicated secondary providers are optional; see
-[Verification Provider](#verification-provider) and
-[Archival Provider](#archival-provider).
+needs the `main` provider.
 
 Choose one main provider family:
 
 OpenAI-compatible chat completions:
 
 ```bash
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --openai-compatible
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --base-url "https://api.openai.com/v1"
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --model "your-model"
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --api-key-env "OPENAI_API_KEY"
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --set-api-key
+python -m moonshine --home moonshine-home provider --target main --openai-compatible
+python -m moonshine --home moonshine-home provider --target main --base-url "https://api.openai.com/v1"
+python -m moonshine --home moonshine-home provider --target main --model "your-model"
+python -m moonshine --home moonshine-home provider --target main --api-key-env "OPENAI_API_KEY"
+python -m moonshine --home moonshine-home provider --target main --set-api-key
 ```
 
 OpenAI Responses:
 
 ```bash
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --openai-responses
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --base-url "https://api.openai.com/v1"
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --model "your-model"
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --api-key-env "OPENAI_API_KEY"
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --set-api-key
+python -m moonshine --home moonshine-home provider --target main --openai-responses
+python -m moonshine --home moonshine-home provider --target main --base-url "https://api.openai.com/v1"
+python -m moonshine --home moonshine-home provider --target main --model "your-model"
+python -m moonshine --home moonshine-home provider --target main --api-key-env "OPENAI_API_KEY"
+python -m moonshine --home moonshine-home provider --target main --set-api-key
 ```
 
 Azure OpenAI:
 
 ```bash
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --azure-openai
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --endpoint "https://your-resource.openai.azure.com/"
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --deployment "your-deployment"
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --api-version "2024-12-01-preview"
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --api-key-env "AZURE_OPENAI_API_KEY"
-python -m moonshine --home /home/ubuntu/.moonshine provider --target main --set-api-key
+python -m moonshine --home moonshine-home provider --target main --azure-openai
+python -m moonshine --home moonshine-home provider --target main --endpoint "https://your-resource.openai.azure.com/"
+python -m moonshine --home moonshine-home provider --target main --deployment "your-deployment"
+python -m moonshine --home moonshine-home provider --target main --api-version "2024-12-01-preview"
+python -m moonshine --home moonshine-home provider --target main --api-key-env "AZURE_OPENAI_API_KEY"
+python -m moonshine --home moonshine-home provider --target main --set-api-key
 ```
+
+Provider notes:
+
+- `--target main`: configure the main chat/research model.
+- `--openai-compatible`, `--openai-responses`, `--azure-openai`: choose the API
+  style.
+- `--base-url` / `--endpoint`: set the provider address.
+- `--model` / `--deployment`: set the model or Azure deployment.
+- `--api-key-env`: name the stored API key.
+- `--set-api-key`: enter and save the API key locally.
 
 ### 4. Check the provider
 
 ```bash
-python -m moonshine --home /home/ubuntu/.moonshine provider --show
+python -m moonshine --home moonshine-home provider --show
 ```
 
 Confirm that:
@@ -219,13 +228,13 @@ verification, and long-running mathematical exploration. For details, see
 [Research Mode](#research-mode).
 
 ```bash
-python -m moonshine --home /home/ubuntu/.moonshine shell --mode research --project my_research_project
+python -m moonshine --home moonshine-home shell --mode research --project my_research_project
 ```
 
 Or start from an input file:
 
 ```bash
-python -m moonshine --home /home/ubuntu/.moonshine shell --mode research \
+python -m moonshine --home moonshine-home shell --mode research \
   --project my_research_project \
   --input-file /path/to/problem-or-notes.md
 ```
@@ -237,13 +246,13 @@ general work that does not need the full research workflow. For details, see
 [Chat Mode](#chat-mode).
 
 ```bash
-python -m moonshine --home /home/ubuntu/.moonshine shell --mode chat --project general
+python -m moonshine --home moonshine-home shell --mode chat --project general
 ```
 
 One-shot chat call:
 
 ```bash
-python -m moonshine --home /home/ubuntu/.moonshine ask --mode chat --project general "Explain Nakayama's lemma."
+python -m moonshine --home moonshine-home ask --mode chat --project general "Explain Nakayama's lemma."
 ```
 
 ### 7. Optional checks
@@ -251,13 +260,13 @@ python -m moonshine --home /home/ubuntu/.moonshine ask --mode chat --project gen
 Check optional dependencies:
 
 ```bash
-python -m moonshine --home /home/ubuntu/.moonshine init --check-deps
+python -m moonshine --home moonshine-home init --check-deps
 ```
 
 Install optional dependencies from the CLI:
 
 ```bash
-python -m moonshine --home /home/ubuntu/.moonshine init --install-deps
+python -m moonshine --home moonshine-home init --install-deps
 ```
 
 ## Runtime Home
@@ -273,15 +282,24 @@ Default:
 Use `--home` when you want a specific runtime directory:
 
 ```bash
-python -m moonshine --home /home/ubuntu/.moonshine init
-python -m moonshine --home /home/ubuntu/.moonshine provider --show
+python -m moonshine --home moonshine-home init
+python -m moonshine --home moonshine-home provider --show
 ```
 
-On Windows:
+No quotes are needed for `moonshine-home` because the path has no spaces. If you
+choose a path containing spaces, wrap it in quotes.
+
+If you want the runtime home outside the downloaded source folder, use a normal
+absolute or home-relative path, for example:
+
+```bash
+python -m moonshine --home ~/moonshine-home init
+```
+
+On Windows PowerShell:
 
 ```powershell
-python -m moonshine --home D:/moonshine-home init
-python -m moonshine --home D:/moonshine-home provider --show
+python -m moonshine --home $env:USERPROFILE\moonshine-home init
 ```
 
 Use the same `--home` for commands that should share projects, sessions,
