@@ -32,7 +32,7 @@ from moonshine.run_agent import AgentEvent, main as run_agent_main, render_agent
 from moonshine.skills.skill_document import parse_skill_document, validate_skill_document
 from moonshine.storage.knowledge_vector_store import SQLiteVectorBackend
 from moonshine.structured_tasks import get_structured_task, list_structured_tasks
-from moonshine.utils import append_jsonl, atomic_write, read_json, read_jsonl, read_text
+from moonshine.utils import ClosingSqliteConnection, append_jsonl, atomic_write, read_json, read_jsonl, read_text
 from moonshine.json_schema import JsonSchemaValidationError
 
 
@@ -1439,7 +1439,7 @@ class MoonshineArchitectureTestCase(unittest.TestCase):
 
         self.assertTrue(matches)
         self.assertIn("REBUILT_TOOL_INDEX_SENTINEL", matches[0]["_search_text"])
-        with sqlite3.connect(str(self.app.paths.sessions_db)) as connection:
+        with sqlite3.connect(str(self.app.paths.sessions_db), factory=ClosingSqliteConnection) as connection:
             row = connection.execute(
                 """
                 SELECT metadata_json FROM session_records
@@ -8458,7 +8458,7 @@ description: Stale runtime builtin skill that no longer exists in packaged asset
         self.assertIn('"source_type": "manual"', markdown)
 
     def test_session_database_uses_wal_mode(self):
-        with sqlite3.connect(str(self.app.paths.sessions_db)) as connection:
+        with sqlite3.connect(str(self.app.paths.sessions_db), factory=ClosingSqliteConnection) as connection:
             mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
         self.assertEqual(str(mode).lower(), "wal")
 

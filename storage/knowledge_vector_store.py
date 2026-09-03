@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover
     Request = urlopen = None
 
 from moonshine.moonshine_constants import MoonshinePaths
-from moonshine.utils import ensure_directory, tokenize
+from moonshine.utils import ClosingSqliteConnection, ensure_directory, tokenize
 
 
 def _unit_vector(vector: Sequence[float]) -> List[float]:
@@ -160,7 +160,7 @@ class SQLiteVectorBackend(object):
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self.db_path))
+        connection = sqlite3.connect(str(self.db_path), factory=ClosingSqliteConnection)
         connection.row_factory = sqlite3.Row
         return connection
 

@@ -11,7 +11,15 @@ from typing import Dict, List, Optional, Sequence
 
 from moonshine.moonshine_constants import MoonshinePaths
 from moonshine.storage.knowledge_vector_store import KnowledgeVectorIndex
-from moonshine.utils import append_jsonl, atomic_write, overlap_score, shorten, tokenize, utc_now
+from moonshine.utils import (
+    ClosingSqliteConnection,
+    append_jsonl,
+    atomic_write,
+    overlap_score,
+    shorten,
+    tokenize,
+    utc_now,
+)
 
 
 class KnowledgeStore(object):
@@ -26,7 +34,7 @@ class KnowledgeStore(object):
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self.db_path))
+        connection = sqlite3.connect(str(self.db_path), factory=ClosingSqliteConnection)
         connection.row_factory = sqlite3.Row
         try:
             connection.execute("PRAGMA journal_mode=WAL")

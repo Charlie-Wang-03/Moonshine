@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import List, Optional
 
-from moonshine.utils import overlap_score, tokenize
+from moonshine.utils import ClosingSqliteConnection, overlap_score, tokenize
 
 
 class SessionStateDB(object):
@@ -23,7 +23,7 @@ class SessionStateDB(object):
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self.db_path))
+        connection = sqlite3.connect(str(self.db_path), factory=ClosingSqliteConnection)
         connection.row_factory = sqlite3.Row
         try:
             connection.execute("PRAGMA journal_mode=WAL")

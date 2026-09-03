@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import unicodedata
 from functools import lru_cache
 from datetime import datetime
@@ -16,6 +17,23 @@ try:
     import tiktoken
 except ImportError:  # pragma: no cover
     tiktoken = None
+
+
+class ClosingSqliteConnection(sqlite3.Connection):
+    """sqlite3.Connection whose context-manager exit also closes the handle.
+
+    ``with sqlite3.connect(...) as conn`` commits or rolls back the transaction
+    but never closes the connection, so every store call leaking through that
+    pattern keeps an open handle on the database file. On Windows those
+    handles lock the file (PermissionError WinError 32 when the directory is
+    deleted); use this factory anywhere the ``with connect()`` idiom is used.
+    """
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
 
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+")
