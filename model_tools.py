@@ -58,6 +58,30 @@ def _execution_payload(event: Dict[str, object]) -> Dict[str, object]:
     return dict(payload) if isinstance(payload, dict) else {}
 
 
+def _turn_lifecycle(runtime: Dict[str, object]) -> Dict[str, object]:
+    """Return monotonically numbered turn starts and currently open sequences."""
+    store, session_id = _execution_store(runtime)
+    paths = getattr(store, "paths", None) if store is not None else None
+    if paths is None:
+        return {"sequence": 0, "open_sequences": []}
+    turn_events = [
+        item
+        for item in read_jsonl(paths.session_turn_events_file(session_id))
+        if isinstance(item, dict) and str(item.get("type") or "") in {"turn_started", "turn_completed"}
+    ]
+    sequence = 0
+    open_sequences: List[int] = []
+    for item in turn_events:
+        if str(item.get("type") or "") == "turn_started":
+            sequence += 1
+            open_sequences.append(sequence)
+        elif open_sequences:
+            # A resumed turn can complete while an older interrupted turn remains
+            # unresolved, so pair completions with the most recent live start.
+            open_sequences.pop()
+    return {"sequence": sequence, "open_sequences": open_sequences}
+
+
 def _unresolved_tool_executions(runtime: Dict[str, object]) -> List[Dict[str, object]]:
     """Return executions that started but cannot be proven terminal.
 
@@ -89,74 +113,40 @@ def _unresolved_tool_executions(runtime: Dict[str, object]) -> List[Dict[str, ob
 
 
 def _prior_interrupted_tool_turn(runtime: Dict[str, object]) -> Optional[Dict[str, object]]:
-    """Return a prior open turn that had tool execution before a later turn began.
+    """Return a prior open turn that executed tools before a later turn began.
 
     A finished handler is not enough to declare the *turn* durable. The process can
     die after the handler returns but before Moonshine records the tool result and
-    final assistant message. Once a later turn has started, such a prior tool-bearing
-    open turn is treated as interrupted and all new tool dispatch fails closed.
+    final assistant message. Each execution intent stores its monotonic turn
+    sequence, so recovery does not rely on coarse wall-clock timestamps.
     """
     store, session_id = _execution_store(runtime)
-    paths = getattr(store, "paths", None) if store is not None else None
-    if store is None or paths is None or not hasattr(store, "get_conversation_events"):
+    if store is None or not hasattr(store, "get_conversation_events"):
         return None
+    lifecycle = _turn_lifecycle(runtime)
+    open_sequences = [int(item) for item in list(lifecycle.get("open_sequences") or [])]
 
-    turn_events = [
-        item
-        for item in read_jsonl(paths.session_turn_events_file(session_id))
-        if isinstance(item, dict) and str(item.get("type") or "") in {"turn_started", "turn_completed"}
-    ]
-    open_turns: List[Dict[str, object]] = []
-    all_starts: List[Dict[str, object]] = []
-    for item in turn_events:
-        if str(item.get("type") or "") == "turn_started":
-            open_turns.append(item)
-            all_starts.append(item)
-        elif open_turns:
-            # A completion belongs to the most recently started live turn. This
-            # preserves an older interrupted turn if a later resumed turn completes.
-            open_turns.pop()
-
-    # During a normal dispatch the current turn itself is open. Only older open
+    # During normal dispatch the current turn itself is open. Only older open
     # turns are recovery hazards.
-    if len(open_turns) <= 1:
+    if len(open_sequences) <= 1:
         return None
-
-    conversation_events = store.get_conversation_events(session_id)
-    execution_starts = [
-        item
-        for item in conversation_events
-        if str(item.get("event_kind") or "") == TOOL_EXECUTION_STARTED
-    ]
-    start_times = [str(item.get("created_at") or "") for item in all_starts]
-
-    for open_turn in open_turns[:-1]:
-        started_at = str(open_turn.get("created_at") or "")
-        if not started_at:
+    prior_sequences = set(open_sequences[:-1])
+    for event in store.get_conversation_events(session_id):
+        if str(event.get("event_kind") or "") != TOOL_EXECUTION_STARTED:
             continue
+        payload = _execution_payload(event)
         try:
-            start_index = start_times.index(started_at)
-        except ValueError:
+            turn_sequence = int(payload.get("turn_sequence") or 0)
+        except (TypeError, ValueError):
+            turn_sequence = 0
+        if turn_sequence not in prior_sequences:
             continue
-        next_started_at = start_times[start_index + 1] if start_index + 1 < len(start_times) else ""
-        matching = []
-        for event in execution_starts:
-            created_at = str(event.get("created_at") or "")
-            if created_at < started_at:
-                continue
-            if next_started_at and created_at >= next_started_at:
-                continue
-            matching.append(event)
-        if not matching:
-            continue
-        first_payload = _execution_payload(matching[0])
         return {
             "state": "interrupted_turn",
-            "execution_id": str(first_payload.get("execution_id") or "turn:%s" % started_at),
-            "tool": str(first_payload.get("tool") or "unknown"),
-            "call_id": str(first_payload.get("call_id") or ""),
-            "turn_started_at": started_at,
-            "tool_execution_count": len(matching),
+            "execution_id": str(payload.get("execution_id") or "turn:%s" % turn_sequence),
+            "tool": str(payload.get("tool") or "unknown"),
+            "call_id": str(payload.get("call_id") or ""),
+            "turn_sequence": turn_sequence,
         }
     return None
 
@@ -212,6 +202,7 @@ def _begin_tool_execution(call: object, runtime: Dict[str, object]) -> str:
         "call_id": call_id,
         "arguments_sha256": arguments_fingerprint["sha256"],
         "arguments_preview": arguments_fingerprint["preview"],
+        "turn_sequence": int(_turn_lifecycle(runtime).get("sequence") or 0),
         "tool_round": runtime.get("_current_tool_round", ""),
         "started_at": utc_now(),
     }
@@ -238,6 +229,7 @@ def _finish_tool_execution(
         "execution_id": execution_id,
         "tool": str(getattr(call, "name", "") or ""),
         "call_id": str(getattr(call, "call_id", "") or ""),
+        "turn_sequence": int(_turn_lifecycle(runtime).get("sequence") or 0),
         "tool_round": runtime.get("_current_tool_round", ""),
         "outcome": "error" if error else "ok",
         "error": shorten(str(error or ""), 500),
@@ -268,6 +260,7 @@ def _mark_tool_execution_ambiguous(
         "call_id": str(getattr(call, "call_id", "") or ""),
         "arguments_sha256": arguments_fingerprint["sha256"],
         "arguments_preview": arguments_fingerprint["preview"],
+        "turn_sequence": int(_turn_lifecycle(runtime).get("sequence") or 0),
         "tool_round": runtime.get("_current_tool_round", ""),
         "state": "ambiguous",
         "interruption_type": type(exc).__name__,
@@ -309,9 +302,7 @@ def _blocked_results(calls: List[object], runtime: Dict[str, object], blockers: 
         },
     )
     if blocker_state == "interrupted_turn":
-        reason = (
-            "a prior tool-bearing turn was interrupted before Moonshine durably completed the turn"
-        )
+        reason = "a prior tool-bearing turn was interrupted before Moonshine durably completed the turn"
     else:
         reason = "a prior tool execution has ambiguous completion"
     message = (
@@ -324,7 +315,7 @@ def _blocked_results(calls: List[object], runtime: Dict[str, object], blockers: 
     public_blockers = [
         {
             key: item.get(key)
-            for key in ("state", "execution_id", "tool", "call_id", "turn_started_at", "started_at", "interrupted_at")
+            for key in ("state", "execution_id", "tool", "call_id", "turn_sequence", "started_at", "interrupted_at")
             if item.get(key) not in {None, ""}
         }
         for item in blockers
