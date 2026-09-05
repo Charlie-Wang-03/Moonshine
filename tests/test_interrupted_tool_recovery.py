@@ -166,7 +166,9 @@ class InterruptedToolRecoveryTest(unittest.TestCase):
         self.assertEqual(len(blocked), 1)
         self.assertIn(execution_id, blocked[0]["payload"]["ambiguous_execution_ids"])
 
-    def test_later_turn_blocks_after_prior_tool_bearing_turn_never_completed(self):
+    def test_completed_resume_turn_does_not_hide_older_interrupted_tool_turn(self):
+        # Turn 1 starts and executes a tool, but the process dies before its
+        # turn_completed record is written.
         self.store.append_turn_event(
             self.session_id,
             {"type": "turn_started", "text": "first", "created_at": "2026-09-05T00:00:00Z"},
@@ -201,11 +203,21 @@ class InterruptedToolRecoveryTest(unittest.TestCase):
                 "output_preview": '{"ok": true}',
             },
         )
-        # Simulate process restart followed by a new user turn. The prior turn has
-        # no turn_completed marker even though its handler returned successfully.
+
+        # Turn 2 is a resumed, tool-free turn that completes. LIFO pairing must
+        # close turn 2, not accidentally consume the older interrupted turn 1.
         self.store.append_turn_event(
             self.session_id,
-            {"type": "turn_started", "text": "resumed", "created_at": "2026-09-05T00:00:00Z"},
+            {"type": "turn_started", "text": "resume-one", "created_at": "2026-09-05T00:00:00Z"},
+        )
+        self.store.append_turn_event(
+            self.session_id,
+            {"type": "turn_completed", "text": "resume-one done", "created_at": "2026-09-05T00:00:00Z"},
+        )
+        # Turn 3 begins and attempts another tool call.
+        self.store.append_turn_event(
+            self.session_id,
+            {"type": "turn_started", "text": "resume-two", "created_at": "2026-09-05T00:00:00Z"},
         )
 
         dispatch_count = []
