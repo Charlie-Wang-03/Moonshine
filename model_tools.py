@@ -94,6 +94,24 @@ def _append_execution_event(
     )
 
 
+def _mark_session_interrupted(runtime: Dict[str, object], interruption: Dict[str, object]) -> None:
+    """Expose interrupted execution state in both session metadata stores."""
+    store, session_id = _execution_store(runtime)
+    if store is None:
+        return
+    now = utc_now()
+    if hasattr(store, "update_session_meta"):
+        store.update_session_meta(
+            session_id,
+            status="interrupted",
+            updated_at=now,
+            interrupted_tool_execution=dict(interruption),
+        )
+    db = getattr(store, "db", None)
+    if db is not None and hasattr(db, "update_session"):
+        db.update_session(session_id, updated_at=now, status="interrupted")
+
+
 def _begin_tool_execution(call: object, runtime: Dict[str, object]) -> str:
     """Write a durable intent record immediately before dispatch."""
     execution_id = "tool-exec-%s" % uuid.uuid4().hex[:12]
@@ -172,25 +190,15 @@ def _mark_tool_execution_ambiguous(
         % (payload["tool"], payload["call_id"] or execution_id),
         payload=payload,
     )
-
-    store, session_id = _execution_store(runtime)
-    if store is None:
-        return
-    if hasattr(store, "update_session_meta"):
-        store.update_session_meta(
-            session_id,
-            status="interrupted",
-            updated_at=now,
-            interrupted_tool_execution={
-                "execution_id": execution_id,
-                "tool": payload["tool"],
-                "call_id": payload["call_id"],
-                "state": "ambiguous",
-            },
-        )
-    db = getattr(store, "db", None)
-    if db is not None and hasattr(db, "update_session"):
-        db.update_session(session_id, updated_at=now, status="interrupted")
+    _mark_session_interrupted(
+        runtime,
+        {
+            "execution_id": execution_id,
+            "tool": payload["tool"],
+            "call_id": payload["call_id"],
+            "state": "ambiguous",
+        },
+    )
 
 
 def _blocked_results(calls: List[object], runtime: Dict[str, object], blockers: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -199,6 +207,15 @@ def _blocked_results(calls: List[object], runtime: Dict[str, object], blockers: 
     blocker_tool = str(first.get("tool") or "unknown")
     blocker_call_id = str(first.get("call_id") or "unknown")
     blocker_execution_id = str(first.get("execution_id") or "unknown")
+    _mark_session_interrupted(
+        runtime,
+        {
+            "execution_id": blocker_execution_id,
+            "tool": blocker_tool,
+            "call_id": blocker_call_id,
+            "state": str(first.get("state") or "ambiguous"),
+        },
+    )
     message = (
         "Tool dispatch is blocked because this session contains an interrupted tool execution "
         "with ambiguous completion: tool=%s, call_id=%s, execution_id=%s. "
@@ -271,7 +288,13 @@ def handle_function_calls(registry, calls: List[object], runtime: Dict[str, obje
                 error=error,
             )
         except BaseException as exc:
-            _mark_tool_execution_ambiguous(call, runtime, execution_id, exc)
+            try:
+                _mark_tool_execution_ambiguous(call, runtime, execution_id, exc)
+            except Exception:
+                # Never replace the process-level interruption with a best-effort
+                # journaling failure. A durable start record, when it was written,
+                # is itself enough for the next process to fail closed.
+                pass
             raise
 
         results.append(
