@@ -8,7 +8,7 @@ import traceback
 import uuid
 from typing import Dict, List, Optional, Sequence
 
-from moonshine.utils import shorten, utc_now
+from moonshine.utils import read_jsonl, shorten, utc_now
 
 
 TOOL_EXECUTION_STARTED = "tool_execution_started"
@@ -38,6 +38,20 @@ def _execution_store(runtime: Dict[str, object]):
     return store, session_id
 
 
+def _render_json(value: object) -> str:
+    """Render a deterministic JSON-ish representation for hashes and previews."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _fingerprint(value: object, preview_chars: int = 800) -> Dict[str, str]:
+    """Return bounded trace metadata without duplicating large tool payloads."""
+    rendered = _render_json(value)
+    return {
+        "sha256": hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+        "preview": shorten(rendered, preview_chars),
+    }
+
+
 def _execution_payload(event: Dict[str, object]) -> Dict[str, object]:
     """Return one execution-event payload defensively."""
     payload = event.get("payload") or {}
@@ -45,7 +59,7 @@ def _execution_payload(event: Dict[str, object]) -> Dict[str, object]:
 
 
 def _unresolved_tool_executions(runtime: Dict[str, object]) -> List[Dict[str, object]]:
-    """Return tool executions that started but have no durable terminal record.
+    """Return executions that started but cannot be proven terminal.
 
     ``tool_execution_ambiguous`` remains blocking by design: Moonshine cannot know
     whether a side-effecting handler completed before the interruption, so retrying
@@ -72,6 +86,79 @@ def _unresolved_tool_executions(runtime: Dict[str, object]) -> List[Dict[str, ob
         record["event_id"] = event.get("id")
         active[execution_id] = record
     return list(active.values())
+
+
+def _prior_interrupted_tool_turn(runtime: Dict[str, object]) -> Optional[Dict[str, object]]:
+    """Return a prior open turn that had tool execution before a later turn began.
+
+    A finished handler is not enough to declare the *turn* durable. The process can
+    die after the handler returns but before Moonshine records the tool result and
+    final assistant message. Once a later turn has started, such a prior tool-bearing
+    open turn is treated as interrupted and all new tool dispatch fails closed.
+    """
+    store, session_id = _execution_store(runtime)
+    paths = getattr(store, "paths", None) if store is not None else None
+    if store is None or paths is None or not hasattr(store, "get_conversation_events"):
+        return None
+
+    turn_events = [
+        item
+        for item in read_jsonl(paths.session_turn_events_file(session_id))
+        if isinstance(item, dict) and str(item.get("type") or "") in {"turn_started", "turn_completed"}
+    ]
+    open_turns: List[Dict[str, object]] = []
+    all_starts: List[Dict[str, object]] = []
+    for item in turn_events:
+        if str(item.get("type") or "") == "turn_started":
+            open_turns.append(item)
+            all_starts.append(item)
+        elif open_turns:
+            # A completion belongs to the most recently started live turn. This
+            # preserves an older interrupted turn if a later resumed turn completes.
+            open_turns.pop()
+
+    # During a normal dispatch the current turn itself is open. Only older open
+    # turns are recovery hazards.
+    if len(open_turns) <= 1:
+        return None
+
+    conversation_events = store.get_conversation_events(session_id)
+    execution_starts = [
+        item
+        for item in conversation_events
+        if str(item.get("event_kind") or "") == TOOL_EXECUTION_STARTED
+    ]
+    start_times = [str(item.get("created_at") or "") for item in all_starts]
+
+    for open_turn in open_turns[:-1]:
+        started_at = str(open_turn.get("created_at") or "")
+        if not started_at:
+            continue
+        try:
+            start_index = start_times.index(started_at)
+        except ValueError:
+            continue
+        next_started_at = start_times[start_index + 1] if start_index + 1 < len(start_times) else ""
+        matching = []
+        for event in execution_starts:
+            created_at = str(event.get("created_at") or "")
+            if created_at < started_at:
+                continue
+            if next_started_at and created_at >= next_started_at:
+                continue
+            matching.append(event)
+        if not matching:
+            continue
+        first_payload = _execution_payload(matching[0])
+        return {
+            "state": "interrupted_turn",
+            "execution_id": str(first_payload.get("execution_id") or "turn:%s" % started_at),
+            "tool": str(first_payload.get("tool") or "unknown"),
+            "call_id": str(first_payload.get("call_id") or ""),
+            "turn_started_at": started_at,
+            "tool_execution_count": len(matching),
+        }
+    return None
 
 
 def _append_execution_event(
@@ -118,11 +205,13 @@ def _begin_tool_execution(call: object, runtime: Dict[str, object]) -> str:
     tool_name = str(getattr(call, "name", "") or "")
     call_id = str(getattr(call, "call_id", "") or "")
     arguments = dict(getattr(call, "arguments", {}) or {})
+    arguments_fingerprint = _fingerprint(arguments)
     payload = {
         "execution_id": execution_id,
         "tool": tool_name,
         "call_id": call_id,
-        "arguments": arguments,
+        "arguments_sha256": arguments_fingerprint["sha256"],
+        "arguments_preview": arguments_fingerprint["preview"],
         "tool_round": runtime.get("_current_tool_round", ""),
         "started_at": utc_now(),
     }
@@ -144,7 +233,7 @@ def _finish_tool_execution(
     error: Optional[str],
 ) -> None:
     """Write the terminal lifecycle record before the next tool is dispatched."""
-    rendered_output = json.dumps(output, ensure_ascii=False, sort_keys=True, default=str)
+    output_fingerprint = _fingerprint(output, preview_chars=1200)
     payload = {
         "execution_id": execution_id,
         "tool": str(getattr(call, "name", "") or ""),
@@ -152,8 +241,8 @@ def _finish_tool_execution(
         "tool_round": runtime.get("_current_tool_round", ""),
         "outcome": "error" if error else "ok",
         "error": shorten(str(error or ""), 500),
-        "output_preview": shorten(rendered_output, 1200),
-        "output_sha256": hashlib.sha256(rendered_output.encode("utf-8")).hexdigest(),
+        "output_preview": output_fingerprint["preview"],
+        "output_sha256": output_fingerprint["sha256"],
         "finished_at": utc_now(),
     }
     _append_execution_event(
@@ -172,11 +261,13 @@ def _mark_tool_execution_ambiguous(
 ) -> None:
     """Record an interrupted dispatch whose external completion is unknowable."""
     now = utc_now()
+    arguments_fingerprint = _fingerprint(dict(getattr(call, "arguments", {}) or {}))
     payload = {
         "execution_id": execution_id,
         "tool": str(getattr(call, "name", "") or ""),
         "call_id": str(getattr(call, "call_id", "") or ""),
-        "arguments": dict(getattr(call, "arguments", {}) or {}),
+        "arguments_sha256": arguments_fingerprint["sha256"],
+        "arguments_preview": arguments_fingerprint["preview"],
         "tool_round": runtime.get("_current_tool_round", ""),
         "state": "ambiguous",
         "interruption_type": type(exc).__name__,
@@ -202,28 +293,42 @@ def _mark_tool_execution_ambiguous(
 
 
 def _blocked_results(calls: List[object], runtime: Dict[str, object], blockers: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
-    """Fail closed instead of dispatching new tools after an ambiguous execution."""
+    """Fail closed instead of dispatching new tools after an interrupted execution."""
     first = dict(blockers[0]) if blockers else {}
     blocker_tool = str(first.get("tool") or "unknown")
     blocker_call_id = str(first.get("call_id") or "unknown")
     blocker_execution_id = str(first.get("execution_id") or "unknown")
+    blocker_state = str(first.get("state") or "ambiguous")
     _mark_session_interrupted(
         runtime,
         {
             "execution_id": blocker_execution_id,
             "tool": blocker_tool,
             "call_id": blocker_call_id,
-            "state": str(first.get("state") or "ambiguous"),
+            "state": blocker_state,
         },
     )
+    if blocker_state == "interrupted_turn":
+        reason = (
+            "a prior tool-bearing turn was interrupted before Moonshine durably completed the turn"
+        )
+    else:
+        reason = "a prior tool execution has ambiguous completion"
     message = (
-        "Tool dispatch is blocked because this session contains an interrupted tool execution "
-        "with ambiguous completion: tool=%s, call_id=%s, execution_id=%s. "
-        "Moonshine will not replay or dispatch additional tools automatically because the prior "
-        "handler may already have produced external side effects. Inspect the session records and "
-        "continue in a fresh session once the ambiguity is resolved."
-        % (blocker_tool, blocker_call_id, blocker_execution_id)
+        "Tool dispatch is blocked because %s: tool=%s, call_id=%s, execution_id=%s. "
+        "Moonshine will not replay or dispatch additional tools automatically because prior "
+        "handlers may already have produced external side effects. Inspect the session records "
+        "and continue in a fresh session once the ambiguity is resolved."
+        % (reason, blocker_tool, blocker_call_id, blocker_execution_id)
     )
+    public_blockers = [
+        {
+            key: item.get(key)
+            for key in ("state", "execution_id", "tool", "call_id", "turn_started_at", "started_at", "interrupted_at")
+            if item.get(key) not in {None, ""}
+        }
+        for item in blockers
+    ]
     results: List[Dict[str, object]] = []
     for call in calls:
         result = {
@@ -233,7 +338,7 @@ def _blocked_results(calls: List[object], runtime: Dict[str, object], blockers: 
             "output": {
                 "status": "blocked_interrupted_execution",
                 "message": message,
-                "ambiguous_executions": [dict(item) for item in blockers],
+                "ambiguous_executions": public_blockers,
             },
             "error": message,
         }
@@ -247,6 +352,7 @@ def _blocked_results(calls: List[object], runtime: Dict[str, object], blockers: 
                 "tool": str(getattr(call, "name", "") or ""),
                 "call_id": str(getattr(call, "call_id", "") or ""),
                 "blocked_at": utc_now(),
+                "blocker_states": [str(item.get("state") or "") for item in blockers],
                 "ambiguous_execution_ids": [str(item.get("execution_id") or "") for item in blockers],
             },
         )
@@ -259,11 +365,13 @@ def handle_function_calls(registry, calls: List[object], runtime: Dict[str, obje
     Each call is journaled immediately before dispatch and receives a durable
     terminal record before the next call begins. If execution is interrupted by a
     process-level exception such as ``KeyboardInterrupt``, the call is marked
-    ambiguous and the exception is re-raised. Future tool batches in the same
-    session fail closed rather than risk replaying a side effect whose completion
-    cannot be proven.
+    ambiguous and the exception is re-raised. A later tool-bearing turn also stays
+    blocked if an earlier tool-bearing turn never reached ``turn_completed``.
     """
     blockers = _unresolved_tool_executions(runtime)
+    interrupted_turn = _prior_interrupted_tool_turn(runtime)
+    if interrupted_turn is not None:
+        blockers.append(interrupted_turn)
     if blockers:
         return _blocked_results(calls, runtime, blockers)
 
@@ -297,15 +405,13 @@ def handle_function_calls(registry, calls: List[object], runtime: Dict[str, obje
                 pass
             raise
 
-        results.append(
-            {
-                "name": call.name,
-                "call_id": getattr(call, "call_id", ""),
-                "arguments": call.arguments,
-                "output": result,
-                "error": error,
-                "execution_id": execution_id,
-            }
-        )
-        runtime.setdefault("_tool_results_in_round", []).append(results[-1])
+        result_record = {
+            "name": call.name,
+            "call_id": getattr(call, "call_id", ""),
+            "arguments": call.arguments,
+            "output": result,
+            "error": error,
+        }
+        results.append(result_record)
+        runtime.setdefault("_tool_results_in_round", []).append(result_record)
     return results
