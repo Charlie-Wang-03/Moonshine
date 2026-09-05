@@ -109,6 +109,8 @@ class InterruptedToolRecoveryTest(unittest.TestCase):
         self.assertEqual(complete_finished[0]["payload"]["outcome"], "ok")
         self.assertTrue(complete_finished[0]["payload"]["output_sha256"])
         self.assertIn('"status": "done"', complete_finished[0]["payload"]["output_preview"])
+        self.assertNotIn("arguments", complete_started[0]["payload"])
+        self.assertIn("arguments_sha256", complete_started[0]["payload"])
 
         self.assertEqual(len(interrupted_started), 1)
         self.assertEqual(len(interrupted_ambiguous), 1)
@@ -119,7 +121,7 @@ class InterruptedToolRecoveryTest(unittest.TestCase):
         self.assertEqual(interrupted_ambiguous[0]["payload"]["state"], "ambiguous")
         self.assertEqual(self.store.get_session_meta(self.session_id)["status"], "interrupted")
 
-    def test_restart_blocks_new_tool_dispatch_after_ambiguous_execution(self):
+    def test_restart_blocks_new_tool_dispatch_after_orphaned_execution_start(self):
         execution_id = "tool-exec-hard-crash"
         self.store.append_conversation_event(
             self.session_id,
@@ -130,7 +132,9 @@ class InterruptedToolRecoveryTest(unittest.TestCase):
                 "execution_id": execution_id,
                 "tool": "external_side_effect",
                 "call_id": "call-before-crash",
-                "arguments": {"value": 1},
+                "arguments_sha256": "deadbeef",
+                "arguments_preview": '{"value": 1}',
+                "turn_sequence": 0,
             },
         )
 
@@ -161,6 +165,69 @@ class InterruptedToolRecoveryTest(unittest.TestCase):
         ]
         self.assertEqual(len(blocked), 1)
         self.assertIn(execution_id, blocked[0]["payload"]["ambiguous_execution_ids"])
+
+    def test_later_turn_blocks_after_prior_tool_bearing_turn_never_completed(self):
+        self.store.append_turn_event(
+            self.session_id,
+            {"type": "turn_started", "text": "first", "created_at": "2026-09-05T00:00:00Z"},
+        )
+        execution_id = "tool-exec-finished-before-crash"
+        self.store.append_conversation_event(
+            self.session_id,
+            event_kind=TOOL_EXECUTION_STARTED,
+            role="tool",
+            content="Tool execution started",
+            payload={
+                "execution_id": execution_id,
+                "tool": "external_side_effect",
+                "call_id": "call-first-turn",
+                "turn_sequence": 1,
+                "arguments_sha256": "abc",
+                "arguments_preview": "{}",
+            },
+        )
+        self.store.append_conversation_event(
+            self.session_id,
+            event_kind=TOOL_EXECUTION_FINISHED,
+            role="tool",
+            content="Tool execution finished",
+            payload={
+                "execution_id": execution_id,
+                "tool": "external_side_effect",
+                "call_id": "call-first-turn",
+                "turn_sequence": 1,
+                "outcome": "ok",
+                "output_sha256": "def",
+                "output_preview": '{"ok": true}',
+            },
+        )
+        # Simulate process restart followed by a new user turn. The prior turn has
+        # no turn_completed marker even though its handler returned successfully.
+        self.store.append_turn_event(
+            self.session_id,
+            {"type": "turn_started", "text": "resumed", "created_at": "2026-09-05T00:00:00Z"},
+        )
+
+        dispatch_count = []
+
+        def must_not_run(runtime):
+            dispatch_count.append(1)
+            return {"unexpected": True}
+
+        registry = ScriptedRegistry({"must_not_run": must_not_run})
+        results = handle_function_calls(
+            registry,
+            [ProviderToolCall(name="must_not_run", arguments={}, call_id="call-resumed")],
+            self._runtime(),
+        )
+
+        self.assertEqual(dispatch_count, [])
+        self.assertEqual(registry.dispatches, [])
+        self.assertEqual(results[0]["output"]["status"], "blocked_interrupted_execution")
+        self.assertIn("prior tool-bearing turn was interrupted", results[0]["error"])
+        blocker = results[0]["output"]["ambiguous_executions"][0]
+        self.assertEqual(blocker["state"], "interrupted_turn")
+        self.assertEqual(blocker["turn_sequence"], 1)
 
     def test_ordinary_tool_error_is_terminal_and_does_not_poison_future_dispatch(self):
         def fail(runtime):
@@ -198,7 +265,7 @@ class InterruptedToolRecoveryTest(unittest.TestCase):
         self.assertEqual(later_effects, ["ran"])
         self.assertIsNone(second[0]["error"])
 
-    def test_dispatch_without_session_store_keeps_legacy_behavior(self):
+    def test_dispatch_without_session_store_keeps_legacy_result_shape(self):
         effects = []
 
         def succeed(runtime, value):
@@ -216,7 +283,10 @@ class InterruptedToolRecoveryTest(unittest.TestCase):
         self.assertEqual(effects, [3])
         self.assertEqual(results[0]["output"], {"value": 3})
         self.assertIsNone(results[0]["error"])
-        self.assertTrue(results[0]["execution_id"].startswith("tool-exec-"))
+        self.assertEqual(
+            set(results[0]),
+            {"name", "call_id", "arguments", "output", "error"},
+        )
 
 
 if __name__ == "__main__":
