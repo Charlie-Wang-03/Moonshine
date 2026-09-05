@@ -6,13 +6,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from moonshine.model_tools import (
+from moonshine.agent_runtime.execution_journal import (
     TOOL_EXECUTION_AMBIGUOUS,
     TOOL_EXECUTION_BLOCKED,
     TOOL_EXECUTION_FINISHED,
     TOOL_EXECUTION_STARTED,
-    handle_function_calls,
 )
+from moonshine.model_tools import handle_function_calls
 from moonshine.moonshine_constants import MoonshinePaths
 from moonshine.providers import ProviderToolCall
 from moonshine.storage.session_store import SessionStore
