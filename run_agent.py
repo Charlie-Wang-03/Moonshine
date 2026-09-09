@@ -1030,6 +1030,65 @@ class AIAgent(object):
                 return False
         return False
 
+    def _sanitize_provider_messages(self, messages):
+        """Demote unpaired tool-call protocol debris to plain text.
+
+        Strict OpenAI-compatible endpoints (OpenAI/Azure/DeepSeek/vLLM) reject orphaned
+        tool_calls with HTTP 400, so requests must never contain them. Pairing is
+        enforced in both directions: assistant tool_calls without matching tool
+        messages are demoted to plain text, and tool messages answering no declared
+        tool_call (stray results, or results with no preceding assistant tool-call
+        message at all) are demoted as well, since the same validators reject them.
+        """
+        def fold_tool_results(tool_messages):
+            return "\n\n".join(
+                "Tool %s result:\n%s"
+                % (str(item.get("tool_call_id") or "?"), str(item.get("content") or ""))
+                for item in tool_messages
+            )
+
+        result = []
+        i, n = 0, len(messages or [])
+        while i < n:
+            msg = dict(messages[i])
+            if msg.get("role") == "assistant" and "tool_calls" in msg and not msg.get("tool_calls"):
+                # Empty tool_calls arrays are protocol noise some validators reject.
+                msg.pop("tool_calls", None)
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                ids = [str(tc.get("id") or "") for tc in msg["tool_calls"]]
+                j = i + 1
+                following = []
+                while j < n and messages[j].get("role") == "tool":
+                    following.append(messages[j])
+                    j += 1
+                matched = [item for item in following if str(item.get("tool_call_id") or "") in ids]
+                stray = [item for item in following if str(item.get("tool_call_id") or "") not in ids]
+                answered = {str(item.get("tool_call_id") or "") for item in matched}
+                if any(declared not in answered for declared in ids):
+                    # Some declared call went unanswered: demote the whole group and
+                    # fold every following result into it. Provider-specific fields
+                    # (e.g. reasoning_content) are intentionally dropped here.
+                    text = "\n\n".join(
+                        part for part in (str(msg.get("content") or "").strip(), fold_tool_results(following)) if part
+                    )
+                    result.append({"role": "assistant", "content": text or "[tool calls not executed]"})
+                    i = j
+                    continue
+                result.append(msg)
+                result.extend(dict(item) for item in matched)
+                if stray:
+                    result.append({"role": "assistant", "content": fold_tool_results(stray)})
+                i = j
+                continue
+            if msg.get("role") == "tool":
+                # Stray tool result with no preceding assistant tool_calls.
+                result.append({"role": "assistant", "content": fold_tool_results([msg])})
+                i += 1
+                continue
+            result.append(msg)
+            i += 1
+        return result
+
     def _stream_provider_round(self, state: ConversationState):
         """Run one provider round and stream text deltas as agent events."""
         streamed_chunks: List[str] = []
@@ -1078,6 +1137,7 @@ class AIAgent(object):
             )
             if status_event is not None:
                 yield status_event
+        state.provider_messages = self._sanitize_provider_messages(state.provider_messages)
         request_messages = self._snapshot_messages(state.provider_messages)
         for provider_event in self.provider.stream_generate(
             system_prompt=state.system_prompt,
@@ -1163,6 +1223,7 @@ class AIAgent(object):
 
         streamed_chunks: List[str] = []
         response = None
+        finalization_messages = self._sanitize_provider_messages(finalization_messages)
         request_messages = self._snapshot_messages(finalization_messages)
         for provider_event in self.provider.stream_generate(
             system_prompt=finalization_prompt,
@@ -1469,6 +1530,32 @@ class AIAgent(object):
                     state.fallback_response_reasoning_content = response.reasoning_content if str(response.reasoning_content or "").strip() else ""
 
                 prepared_calls, invalid_batch = self._prepare_tool_calls(state, response.tool_calls)
+                # The tool-round budget gates only REAL executable rounds. The
+                # invalid-batch / no-executable paths are validation-feedback paths that
+                # attach synthetic tool results and do NOT consume a tool round, so they
+                # must not be preempted by the budget guard below. We break before
+                # appending the assistant tool-call message so a gated round never leaves
+                # orphaned tool_calls (which strict OpenAI-compatible endpoints reject).
+                if (
+                    not invalid_batch
+                    and any(item.status == "execute" for item in prepared_calls)
+                    and state.tool_rounds >= state.budget.max_tool_rounds
+                ):
+                    state.final_reason = "tool_round_limit_reached"
+                    if round_text:
+                        # The guard drops only the tool_calls; the round's text must
+                        # still join the provider conversation as a plain assistant
+                        # message (no tool_calls, so no orphan risk), otherwise the
+                        # finalization pass cannot see what the model already wrote.
+                        state.provider_messages.append({"role": "assistant", "content": round_text})
+                    status_event = self._emit_status(
+                        state,
+                        "Tool round limit reached; finalizing without more tool execution.",
+                        max_tool_rounds=state.budget.max_tool_rounds,
+                    )
+                    if status_event is not None:
+                        yield status_event
+                    break
                 repaired_calls = [item for item in prepared_calls if item.repaired_from]
                 if repaired_calls:
                     repaired_text = ", ".join(
@@ -1542,17 +1629,6 @@ class AIAgent(object):
                     if status_event is not None:
                         yield status_event
                     continue
-
-                if state.tool_rounds >= state.budget.max_tool_rounds:
-                    state.final_reason = "tool_round_limit_reached"
-                    status_event = self._emit_status(
-                        state,
-                        "Tool round limit reached; finalizing without more tool execution.",
-                        max_tool_rounds=state.budget.max_tool_rounds,
-                    )
-                    if status_event is not None:
-                        yield status_event
-                    break
 
                 state.tool_rounds += 1
                 state.post_tool_nudge_used = False
