@@ -1,0 +1,66 @@
+name: PR 4 productionization validation
+
+on:
+  push:
+    branches:
+      - test/pr4-productionization
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out PR 4 head
+        uses: actions/checkout@v7
+        with:
+          ref: fix/interrupted-tool-recovery
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install Moonshine
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+      - name: Compile changed files
+        run: |
+          python -m compileall agent_runtime/execution_journal.py model_tools.py tests/test_interrupted_tool_recovery.py
+      - name: Run PR 4 focused regression
+        run: python -m unittest -v tests.test_interrupted_tool_recovery
+      - name: Run merged PR 1 protocol regression
+        run: python -m unittest -v tests.test_tool_round_limit_orphan
+
+  full-suite-summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        ref:
+          - main
+          - fix/interrupted-tool-recovery
+    steps:
+      - name: Check out ${{ matrix.ref }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.ref }}
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Install Moonshine
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+      - name: Run full suite and preserve baseline failures as evidence
+        shell: bash
+        run: |
+          set +e
+          echo "VALIDATION_REF=${{ matrix.ref }}"
+          python -m unittest discover -s tests -p "test*.py"
+          rc=$?
+          echo "UNITTEST_EXIT_CODE=${rc}"
+          exit 0
